@@ -1,0 +1,153 @@
+"""Bayesian MMM with PyMC."""
+
+from typing import Dict, List, Optional
+
+import numpy as np
+
+from .base import BaseMMM
+
+try:
+    import pymc as pm
+    import arviz as az
+
+    PYMC_AVAILABLE = True
+except ImportError:
+    PYMC_AVAILABLE = False
+
+
+class BayesianMMM(BaseMMM):
+    """Bayesian MMM with priors and optional constraints."""
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_controls: int,
+        positive_constraints: bool = True,
+        lag_sum_lower: Optional[float] = None,
+        lag_sum_upper: Optional[float] = None,
+        channel_names: Optional[List[str]] = None,
+        samples: int = 1000,
+        tune: int = 500,
+        chains: int = 2,
+    ):
+        if not PYMC_AVAILABLE:
+            raise ImportError(
+                "PyMC and ArviZ required for Bayesian model. Install with: pip install pymc arviz"
+            )
+        self.n_channels = n_channels
+        self.n_controls = n_controls
+        self.positive_constraints = positive_constraints
+        self.lag_sum_lower = lag_sum_lower
+        self.lag_sum_upper = lag_sum_upper
+        self.channel_names = channel_names or [f"channel_{i}" for i in range(n_channels)]
+        self.samples = samples
+        self.tune = tune
+        self.chains = chains
+        self.idata_ = None
+        self.coef_ = None
+        self.intercept_ = None
+
+    def _design_matrix(self, X: np.ndarray, X_control: Optional[np.ndarray]) -> np.ndarray:
+        if X_control is not None and X_control.size > 0:
+            return np.hstack([X, X_control])
+        return X
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        X_control: Optional[np.ndarray] = None,
+    ) -> "BayesianMMM":
+        X_design = self._design_matrix(X, X_control)
+        n_features = X_design.shape[1]
+
+        with pm.Model() as model:
+            # Intercept
+            intercept = pm.Normal("intercept", mu=np.mean(y), sigma=50)
+
+            # Channel coefficients - positive if constrained
+            if self.positive_constraints:
+                channel_coef = pm.HalfNormal(
+                    "channel_coef",
+                    sigma=50,
+                    shape=self.n_channels,
+                )
+            else:
+                channel_coef = pm.Normal(
+                    "channel_coef",
+                    mu=0,
+                    sigma=50,
+                    shape=self.n_channels,
+                )
+
+            # Control coefficients
+            if self.n_controls > 0:
+                control_coef = pm.Normal(
+                    "control_coef",
+                    mu=0,
+                    sigma=20,
+                    shape=self.n_controls,
+                )
+                mu = (
+                    intercept
+                    + pm.math.dot(X[:, : self.n_channels], channel_coef)
+                    + pm.math.dot(X[:, self.n_channels :], control_coef)
+                )
+            else:
+                mu = intercept + pm.math.dot(X, channel_coef)
+
+            # Lag sum constraint: soft prior encouraging sum in [lb, ub]
+            if self.lag_sum_lower is not None and self.lag_sum_upper is not None:
+                lag_sum = pm.math.sum(channel_coef)
+                mid = (self.lag_sum_lower + self.lag_sum_upper) / 2
+                half_range = (self.lag_sum_upper - self.lag_sum_lower) / 4
+                pm.Potential(
+                    "lag_sum_prior",
+                    pm.logp(pm.Normal.dist(mu=mid, sigma=half_range + 1), lag_sum),
+                )
+
+            sigma = pm.HalfNormal("sigma", sigma=20)
+            pm.Normal("y", mu=mu, sigma=sigma, observed=y)
+
+            self.idata_ = pm.sample(
+                draws=self.samples,
+                tune=self.tune,
+                chains=self.chains,
+                return_inferencedata=True,
+                progressbar=False,
+                target_accept=0.9,
+            )
+
+        # Store posterior means
+        post = self.idata_.posterior
+        self.intercept_ = float(post["intercept"].mean())
+        self.coef_ = np.concatenate([
+            [self.intercept_],
+            post["channel_coef"].mean(dim=["chain", "draw"]).values,
+            post["control_coef"].mean(dim=["chain", "draw"]).values
+            if self.n_controls > 0
+            else [],
+        ])
+        return self
+
+    def predict(
+        self,
+        X: np.ndarray,
+        X_control: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        X_design = self._design_matrix(X, X_control)
+        ones = np.ones((X.shape[0], 1))
+        X_full = np.hstack([ones, X_design])
+        return X_full @ self.coef_
+
+    def get_coefficients(self) -> Dict[str, float]:
+        d = {"intercept": float(self.intercept_)}
+        post = self.idata_.posterior
+        ch = post["channel_coef"]
+        for i, name in enumerate(self.channel_names):
+            d[name] = float(ch.isel({ch.dims[0]: i}).mean())
+        if self.n_controls > 0:
+            ctrl = post["control_coef"]
+            for i in range(self.n_controls):
+                d[f"control_{i}"] = float(ctrl.isel({ctrl.dims[0]: i}).mean())
+        return d
