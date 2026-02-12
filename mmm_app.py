@@ -3,6 +3,8 @@ Marketing Mix Modelling (MMM) - Step-by-Step Wizard
 
 Step 1: Brand, Model, Data, Channels, Date, Target, Segments
 Step 2: Per-channel transform, curvature, adstock, Fit model
+Step 3: ROI inputs - brand unit price, promotional unit cost per channel
+Step 4: Results - ROI, mROI, channel & segment graphs
 """
 
 import os
@@ -346,22 +348,9 @@ def render_step2():
 
     if st.session_state.get("fitted"):
         st.divider()
-        st.subheader("Results")
-        pipeline = st.session_state.pipeline
-        plot_df = df.copy()
-        plot_df["predicted"] = pipeline.predict(df)
-        x_ax = plot_df[date_col] if date_col in plot_df.columns else plot_df.index
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=x_ax, y=plot_df[target_col], name="Actual", line=dict(color="#1f77b4")))
-        fig.add_trace(go.Scatter(x=x_ax, y=plot_df["predicted"], name="Predicted", line=dict(color="#ff7f0e", dash="dash")))
-        fig.update_layout(title=f"{st.session_state.brand_name} - Actual vs Predicted")
-        st.plotly_chart(fig, use_container_width=True)
-
-        coef_df = pd.DataFrame(
-            [{"Variable": k, "Coefficient": v} for k, v in pipeline.get_coefficients().items()]
-        )
-        fig_bar = px.bar(coef_df[coef_df["Variable"] != "intercept"], x="Variable", y="Coefficient", color="Coefficient")
-        st.plotly_chart(fig_bar, use_container_width=True)
+        if st.button("Next: Step 3 →", type="primary", key="step2_next"):
+            st.session_state.step = 3
+            st.rerun()
 
     st.divider()
     if st.button("← Back to Step 1", key="step2_back"):
@@ -369,17 +358,269 @@ def render_step2():
         st.rerun()
 
 
+def _safe_float(val, default=1.0):
+    """Safely convert to float for Streamlit number_input."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============ STEP 3 ============
+def render_step3():
+    if st.session_state.df is None or not st.session_state.channel_cols or not st.session_state.get("fitted"):
+        st.warning("Complete Step 1 and Step 2 (fit model) first.")
+        st.session_state.step = 1
+        st.rerun()
+    st.header("Step 3: ROI Inputs")
+    st.caption("Enter brand unit price and promotional unit cost per channel for ROI calculation")
+
+    channel_cols = st.session_state.channel_cols
+
+    col1, col2 = st.columns(2)
+    with col1:
+        roi_default = _safe_float(st.session_state.get("roi_unit_price"), 1.0)
+        brand_unit_price = st.number_input(
+            "Brand unit price ($ per unit of target)",
+            min_value=0.01,
+            value=roi_default,
+            step=0.1,
+            format="%.2f",
+            help="Price per unit of your target variable (e.g. $ per sale). Use 1.0 if target is already revenue.",
+            key="roi_unit_price",
+        )
+    with col2:
+        st.info("Cost per $1 of spend: 1.0 = spend equals cost; 1.1 = 10% overhead")
+
+    st.subheader("Promotional unit cost per channel")
+    st.caption("Cost per $1 of spend (e.g. 1.0 = media spend only)")
+    channel_costs = {}
+    n_cols = min(len(channel_cols), 4)
+    for i in range(0, len(channel_cols), n_cols):
+        cost_cols = st.columns(n_cols)
+        for j in range(n_cols):
+            if i + j < len(channel_cols):
+                ch = channel_cols[i + j]
+                cost_key = f"roi_cost_{ch}"
+                cost_default = _safe_float(st.session_state.get(cost_key), 1.0)
+                with cost_cols[j]:
+                    channel_costs[ch] = st.number_input(
+                        ch,
+                        min_value=0.01,
+                        value=cost_default,
+                        step=0.05,
+                        format="%.2f",
+                        key=cost_key,
+                    )
+    st.session_state.channel_costs = channel_costs
+
+    st.divider()
+    if st.button("Next: Step 4 → Results", type="primary", key="step3_next"):
+        st.session_state.step = 4
+        st.rerun()
+    if st.button("← Back to Step 2", key="step3_back"):
+        st.session_state.step = 2
+        st.rerun()
+
+
+# ============ STEP 4 ============
+def render_step4():
+    if st.session_state.df is None or not st.session_state.channel_cols or not st.session_state.get("fitted"):
+        st.warning("Complete Steps 1–3 first.")
+        st.session_state.step = 1
+        st.rerun()
+    st.header("Step 4: Results & Insights")
+    st.caption(f"Brand: {st.session_state.brand_name} - ROI, mROI, channel & segment analysis")
+
+    df = st.session_state.df
+    channel_cols = st.session_state.channel_cols
+    target_col = st.session_state.target_col
+    date_col = st.session_state.date_col or "date"
+    segment_cols = st.session_state.segment_cols
+    pipeline = st.session_state.pipeline
+    brand_unit_price = st.session_state.get("roi_unit_price", 1.0)
+    channel_costs = st.session_state.get("channel_costs", {ch: 1.0 for ch in channel_cols})
+
+    contributions = pipeline.get_channel_contributions(df)
+    plot_df = df.copy()
+    plot_df["predicted"] = pipeline.predict(df)
+    for ch in channel_cols:
+        plot_df[f"contrib_{ch}"] = contributions.get(ch, np.zeros(len(df)))
+
+    # ROI computation
+    roi_data = []
+    for ch in channel_cols:
+        total_contrib = float(np.sum(contributions.get(ch, np.zeros(len(df)))))
+        total_spend = float(df[ch].sum())
+        cost_per = channel_costs.get(ch, 1.0)
+        total_cost = total_spend * cost_per
+        revenue = total_contrib * brand_unit_price
+        roi_pct = ((revenue - total_cost) / total_cost * 100) if total_cost > 0 else 0.0
+        mroi = pipeline.get_marginal_roi(df, ch)
+        mroi_pct = ((mroi * brand_unit_price) / cost_per - 1) * 100 if cost_per > 0 else 0.0
+        roi_data.append({
+            "Channel": ch,
+            "Spend ($)": round(total_spend, 2),
+            "Cost ($)": round(total_cost, 2),
+            "Contribution": round(total_contrib, 2),
+            "Revenue ($)": round(revenue, 2),
+            "ROI (%)": round(roi_pct, 1),
+            "mROI (%)": round(mroi_pct, 1),
+        })
+    roi_df = pd.DataFrame(roi_data)
+
+    # --- Row 1: Actual vs Predicted, Model fit ---
+    st.subheader("Model fit")
+    r2 = pipeline.score(df)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("R² Score", f"{r2:.4f}")
+    with col2:
+        st.metric("Observations", len(df))
+    with col3:
+        st.metric("Channels", len(channel_cols))
+
+    x_ax = plot_df[date_col] if date_col in plot_df.columns else plot_df.index
+    fig_fit = go.Figure()
+    fig_fit.add_trace(go.Scatter(x=x_ax, y=plot_df[target_col], name="Actual", line=dict(color="#1f77b4")))
+    fig_fit.add_trace(go.Scatter(x=x_ax, y=plot_df["predicted"], name="Predicted", line=dict(color="#ff7f0e", dash="dash")))
+    fig_fit.update_layout(title=f"{st.session_state.brand_name} - Actual vs Predicted")
+    st.plotly_chart(fig_fit, use_container_width=True)
+
+    # --- Row 2: Coefficient bar, ROI bar, mROI bar ---
+    st.subheader("Channel coefficients & ROI")
+    coef_df = pd.DataFrame([{"Variable": k, "Coefficient": v} for k, v in pipeline.get_coefficients().items() if k != "intercept"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig_coef = px.bar(coef_df, x="Variable", y="Coefficient", color="Coefficient", title="Coefficients")
+        st.plotly_chart(fig_coef, use_container_width=True)
+    with c2:
+        fig_roi = px.bar(roi_df, x="Channel", y="ROI (%)", color="ROI (%)", color_continuous_scale="RdYlGn", title="ROI by Channel")
+        st.plotly_chart(fig_roi, use_container_width=True)
+    with c3:
+        fig_mroi = px.bar(roi_df, x="Channel", y="mROI (%)", color="mROI (%)", color_continuous_scale="RdYlGn", title="Marginal ROI by Channel")
+        st.plotly_chart(fig_mroi, use_container_width=True)
+
+    st.dataframe(roi_df, use_container_width=True, hide_index=True)
+
+    # --- ROI vs mROI comparison ---
+    st.subheader("ROI vs Marginal ROI")
+    roi_melt = roi_df.melt(id_vars=["Channel"], value_vars=["ROI (%)", "mROI (%)"], var_name="Metric", value_name="Value")
+    fig_roi_mroi = px.bar(roi_melt, x="Channel", y="Value", color="Metric", barmode="group", title="ROI vs mROI by channel")
+    st.plotly_chart(fig_roi_mroi, use_container_width=True)
+
+    # --- Row 3: Spend over time, Contribution over time ---
+    st.subheader("Spend & contribution over time")
+    spend_cols = [c for c in channel_cols if c in plot_df.columns]
+    if spend_cols:
+        fig_spend = go.Figure()
+        for ch in spend_cols:
+            fig_spend.add_trace(go.Scatter(x=x_ax, y=plot_df[ch], name=ch, stackgroup="one"))
+        fig_spend.update_layout(title="Spend by channel over time", barmode="stack")
+        st.plotly_chart(fig_spend, use_container_width=True)
+
+    contrib_cols = [f"contrib_{ch}" for ch in channel_cols if f"contrib_{ch}" in plot_df.columns]
+    if contrib_cols:
+        fig_contrib = go.Figure()
+        for ch in channel_cols:
+            if f"contrib_{ch}" in plot_df.columns:
+                fig_contrib.add_trace(go.Scatter(x=x_ax, y=plot_df[f"contrib_{ch}"], name=ch, stackgroup="one"))
+        fig_contrib.update_layout(title="Contribution by channel over time")
+        st.plotly_chart(fig_contrib, use_container_width=True)
+
+    # --- Row 4: ROI vs Spend scatter, Pie charts ---
+    st.subheader("Spend & contribution mix")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        fig_pie_spend = px.pie(roi_df, values="Spend ($)", names="Channel", title="Spend share by channel")
+        st.plotly_chart(fig_pie_spend, use_container_width=True)
+    with p2:
+        fig_pie_rev = px.pie(roi_df, values="Revenue ($)", names="Channel", title="Revenue share by channel")
+        st.plotly_chart(fig_pie_rev, use_container_width=True)
+    with p3:
+        fig_scatter = px.scatter(roi_df, x="Spend ($)", y="ROI (%)", color="Channel", size="Revenue ($)", title="ROI vs Spend")
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # --- Row 5: Contribution heatmap ---
+    st.subheader("Contribution heatmap")
+    contrib_matrix = np.column_stack([contributions.get(ch, np.zeros(len(df))) for ch in channel_cols])
+    fig_heat = px.imshow(
+        contrib_matrix.T,
+        labels=dict(x="Period", y="Channel", color="Contribution"),
+        x=[str(i) for i in range(len(df))],
+        y=channel_cols,
+        aspect="auto",
+        color_continuous_scale="Blues",
+    )
+    fig_heat.update_layout(title="Channel contribution over time (heatmap)")
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    # --- Cumulative contribution ---
+    st.subheader("Cumulative contribution by channel")
+    cum_contrib = {ch: np.cumsum(contributions.get(ch, np.zeros(len(df)))) for ch in channel_cols}
+    fig_cum = go.Figure()
+    for ch in channel_cols:
+        fig_cum.add_trace(go.Scatter(x=x_ax, y=cum_contrib[ch], name=ch, mode="lines"))
+    fig_cum.update_layout(title="Cumulative contribution over time")
+    st.plotly_chart(fig_cum, use_container_width=True)
+
+    # --- Revenue per $ spend (efficiency) ---
+    roi_df["Rev per $"] = np.where(roi_df["Spend ($)"] > 0, roi_df["Revenue ($)"] / roi_df["Spend ($)"], 0)
+    fig_eff = px.bar(roi_df, x="Channel", y="Rev per $", color="Rev per $", title="Revenue per $1 spend (efficiency)")
+    st.plotly_chart(fig_eff, use_container_width=True)
+
+    # --- Row 6: Segment-level ROI (if segments exist) ---
+    if segment_cols:
+        st.subheader("Segment-level ROI")
+        for seg_col in segment_cols:
+            if seg_col not in df.columns:
+                continue
+            seg_vals = df[seg_col].dropna().unique()
+            seg_roi = []
+            for seg_val in seg_vals[:10]:
+                mask = df[seg_col] == seg_val
+                seg_df = df[mask]
+                total_spend_seg = sum(seg_df[ch].sum() for ch in channel_cols)
+                total_target_seg = seg_df[target_col].sum()
+                revenue_seg = total_target_seg * brand_unit_price
+                cost_seg = 0
+                for ch in channel_cols:
+                    cost_seg += seg_df[ch].sum() * channel_costs.get(ch, 1.0)
+                roi_seg = ((revenue_seg - cost_seg) / cost_seg * 100) if cost_seg > 0 else 0.0
+                seg_roi.append({"Segment": str(seg_val), "Spend ($)": round(total_spend_seg, 2), "Revenue ($)": round(revenue_seg, 2), "ROI (%)": round(roi_seg, 1)})
+            seg_roi_df = pd.DataFrame(seg_roi)
+            st.caption(f"By {seg_col}")
+            st.dataframe(seg_roi_df, use_container_width=True, hide_index=True)
+            fig_seg = px.bar(seg_roi_df, x="Segment", y="ROI (%)", color="ROI (%)", color_continuous_scale="RdYlGn")
+            st.plotly_chart(fig_seg, use_container_width=True)
+
+    st.divider()
+    if st.button("← Back to Step 3", key="step4_back"):
+        st.session_state.step = 3
+        st.rerun()
+
+
 # ============ MAIN ============
 st.title("📊 Marketing Mix Modelling")
-st.caption(f"Brand: {st.session_state.brand_name or '(not set)'}  |  Step {st.session_state.step} of 2")
+st.caption(f"Brand: {st.session_state.brand_name or '(not set)'}  |  Step {st.session_state.step} of 4")
 
-step_indicator = st.columns(2)
+step_indicator = st.columns(4)
 with step_indicator[0]:
     st.markdown("**Step 1**" + (" ✓" if st.session_state.step > 1 else " ←"))
 with step_indicator[1]:
-    st.markdown("**Step 2**" + (" ←" if st.session_state.step == 2 else ""))
+    st.markdown("**Step 2**" + (" ✓" if st.session_state.step > 2 else (" ←" if st.session_state.step == 2 else "")))
+with step_indicator[2]:
+    st.markdown("**Step 3**" + (" ✓" if st.session_state.step > 3 else (" ←" if st.session_state.step == 3 else "")))
+with step_indicator[3]:
+    st.markdown("**Step 4**" + (" ←" if st.session_state.step == 4 else ""))
 
 if st.session_state.step == 1:
     render_step1()
-else:
+elif st.session_state.step == 2:
     render_step2()
+elif st.session_state.step == 3:
+    render_step3()
+else:
+    render_step4()
