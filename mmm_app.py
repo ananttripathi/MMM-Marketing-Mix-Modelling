@@ -1,11 +1,8 @@
 """
-Marketing Mix Modelling (MMM) Frontend
+Marketing Mix Modelling (MMM) - Step-by-Step Wizard
 
-Streamlit app for MMM with:
-- Dataset upload
-- Adstock decay, saturation curvature
-- Model selection: Linear, Ridge, Lasso, Bayesian, Hierarchical
-- Constraints: positive coefficients, lag sum range
+Step 1: Brand, Model, Data, Channels, Date, Target, Segments
+Step 2: Per-channel transform, curvature, adstock, Fit model
 """
 
 import os
@@ -17,272 +14,372 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 
-# Add project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mmm.config import MMMConfig, infer_target_column, infer_channel_columns
-from mmm.pipeline import MMMPipeline
 
 st.set_page_config(
-    page_title="Marketing Mix Modelling",
+    page_title="MMM - Marketing Mix Modelling",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-st.title("📊 Marketing Mix Modelling")
-st.markdown(
-    "Configure transforms, model type, and constraints to fit your MMM and attribute sales to marketing channels."
-)
+# Initialize session state
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "brand_name" not in st.session_state:
+    st.session_state.brand_name = ""
+if "channel_cols" not in st.session_state:
+    st.session_state.channel_cols = []
+if "date_col" not in st.session_state:
+    st.session_state.date_col = None
+if "target_col" not in st.session_state:
+    st.session_state.target_col = None
+if "segment_cols" not in st.session_state:
+    st.session_state.segment_cols = []
+if "control_cols" not in st.session_state:
+    st.session_state.control_cols = []
+if "model_type" not in st.session_state:
+    st.session_state.model_type = "linear"
 
-# Sidebar: Data & Params
-with st.sidebar:
-    st.header("📁 Data")
-    use_sample = st.checkbox("Use sample dataset", value=True)
-    if use_sample:
-        sample_path = os.path.join(
-            os.path.dirname(__file__),
-            "data",
-            "marketing_mix_weekly.csv",
+
+def load_sample_data():
+    path = os.path.join(os.path.dirname(__file__), "data", "marketing_mix_weekly.csv")
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+    return None
+
+
+# ============ STEP 1 ============
+def render_step1():
+    st.header("Step 1: Setup & Column Mapping")
+    st.caption("Brand, model type, data source, and column mapping")
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        st.session_state.brand_name = st.text_input(
+            "Brand name",
+            value=st.session_state.brand_name or "My Brand",
+            placeholder="Enter brand name",
         )
-        if os.path.exists(sample_path):
-            df = pd.read_csv(sample_path)
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-            st.success(f"Loaded: {len(df)} rows")
+        model_type = st.selectbox(
+            "Model type",
+            ["linear", "ridge", "lasso", "bayesian", "hierarchical"],
+            format_func=lambda x: {
+                "linear": "Linear",
+                "ridge": "Ridge",
+                "lasso": "Lasso",
+                "bayesian": "Bayesian",
+                "hierarchical": "Hierarchical",
+            }[x],
+            key="step1_model",
+        )
+        st.session_state.model_type = model_type
+
+        st.subheader("Data source")
+        data_source = st.radio(
+            "Source",
+            ["Sample dataset", "Upload CSV", "Generate dataset"],
+            key="step1_source",
+        )
+
+        if data_source == "Sample dataset":
+            df = load_sample_data()
+            if df is not None:
+                st.session_state.df = df
+                st.success(f"Loaded: {len(df)} rows")
+            else:
+                st.error("Sample not found. Use Generate dataset.")
+                st.session_state.df = None
+
+        elif data_source == "Upload CSV":
+            uploaded = st.file_uploader("Upload CSV", type=["csv"], key="step1_upload")
+            if uploaded:
+                df = pd.read_csv(uploaded)
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"])
+                st.session_state.df = df
+                st.success(f"Loaded: {len(df)} rows")
+            else:
+                st.session_state.df = None
+
+        else:  # Generate
+            from create_mmm_dataset import generate_mmm_dataset, FREQ_MAP
+
+            gen_start = st.text_input("Start date", "2020-01-01", key="gen_start")
+            gen_end = st.text_input("End date", "2023-12-31", key="gen_end")
+            gen_freq = st.selectbox("Frequency", ["daily", "weekly", "monthly", "yearly"], index=1, key="gen_freq")
+            gen_channels = st.text_input(
+                "Channel names (comma-separated)",
+                "tv_spend, digital_spend, radio_spend, print_spend, social_spend",
+                key="gen_ch",
+            )
+            if st.button("Generate", key="gen_btn"):
+                ch_list = [c.strip() for c in gen_channels.split(",") if c.strip()] or None
+                try:
+                    df = generate_mmm_dataset(
+                        start_date=gen_start, end_date=gen_end,
+                        freq=FREQ_MAP[gen_freq], channel_names=ch_list, seed=42,
+                    )
+                    df["date"] = pd.to_datetime(df["date"])
+                    st.session_state.df = df
+                    st.success(f"Generated: {len(df)} rows")
+                except Exception as e:
+                    st.error(str(e))
+
+    with col2:
+        df = st.session_state.df
+        if df is not None:
+            st.subheader("Column mapping")
+            st.caption("List all columns below. Select channels by moving them to the right.")
+
+            cols = df.columns.tolist()
+            inferred_target = infer_target_column(cols)
+            target_idx = cols.index(inferred_target) if inferred_target in cols else 0
+
+            # Date column
+            date_candidates = [c for c in cols if "date" in c.lower() or "time" in c.lower() or "week" in c.lower()]
+            date_idx = cols.index(date_candidates[0]) if date_candidates else 0
+            date_col = st.selectbox(
+                "Date column",
+                cols,
+                index=date_idx,
+                key="step1_date",
+            )
+            st.session_state.date_col = date_col
+
+            # Target column
+            target_col = st.selectbox(
+                "Target column (sales/revenue)",
+                cols,
+                index=target_idx,
+                key="step1_target",
+            )
+            st.session_state.target_col = target_col
+
+            # Channel selector - dual list style
+            exclude = [date_col, target_col]
+            available = [c for c in cols if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+            default_ch = infer_channel_columns(df, target_col, ["date"])
+            st.caption("Select columns for marketing channels. In multiselect: click to add, order = priority.")
+            channel_cols = st.multiselect(
+                "Marketing channels",
+                available,
+                default=default_ch,
+                key="step1_channels",
+                help="Pick columns to use as marketing spend channels (e.g. TV, Digital, Radio)",
+            )
+            st.session_state.channel_cols = channel_cols
+
+            # Segment columns
+            segment_options = [c for c in cols if c not in [date_col, target_col] and c not in channel_cols]
+            segment_cols = st.multiselect(
+                "Segment columns (optional - for segment-level modelling)",
+                segment_options,
+                default=[],
+                key="step1_segments",
+                help="e.g. Region, Product category - for modelling by segment",
+            )
+            st.session_state.segment_cols = segment_cols
+
+            # Control columns (remaining)
+            used = [date_col, target_col] + channel_cols + segment_cols
+            control_options = [c for c in cols if c not in used]
+            control_cols = st.multiselect(
+                "Control columns (optional)",
+                control_options,
+                default=[c for c in ["week_of_year", "month", "holiday_period", "promotion"] if c in control_options],
+                key="step1_controls",
+            )
+            st.session_state.control_cols = control_cols
+
+            st.info(f"**Summary:** {len(channel_cols)} channels, target=`{target_col}`")
+
         else:
-            st.error("Sample dataset not found. Run create_mmm_dataset.py first.")
-            df = None
-    else:
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
-        if uploaded:
-            df = pd.read_csv(uploaded)
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-            st.success(f"Loaded: {len(df)} rows")
-        else:
-            df = None
+            st.info("Load or generate data first.")
 
-    st.header("🔄 Transforms")
-    decay = st.slider(
-        "Adstock decay (carryover)",
-        min_value=0.0,
-        max_value=0.95,
-        value=0.5,
-        step=0.05,
-        help="Higher = longer carryover effect from past spend",
-    )
-    max_lag = st.slider(
-        "Adstock max lag (weeks)",
-        min_value=1,
-        max_value=8,
-        value=4,
-    )
-    alpha = st.slider(
-        "Saturation curvature (Hill alpha)",
-        min_value=0.3,
-        max_value=2.0,
-        value=1.0,
-        step=0.1,
-        help=">1 = S-curve, 1 = concave, <1 = convex",
-    )
-    half_sat = st.number_input(
-        "Half-saturation (optional, 0 = auto)",
-        min_value=0.0,
-        value=0.0,
-        step=10.0,
-        help="Spend level at 50% saturation. 0 = auto from data",
-    )
+    if st.session_state.df is not None and st.session_state.channel_cols:
+        st.divider()
+        if st.button("Next: Step 2 →", type="primary", key="step1_next"):
+            st.session_state.step = 2
+            st.rerun()
 
-    st.header("🧮 Model")
-    model_type = st.selectbox(
-        "Model type",
-        ["linear", "ridge", "lasso", "bayesian", "hierarchical"],
-        format_func=lambda x: {
-            "linear": "Linear",
-            "ridge": "Ridge",
-            "lasso": "Lasso",
-            "bayesian": "Bayesian",
-            "hierarchical": "Hierarchical",
-        }[x],
-    )
-    ridge_alpha = 1.0
-    lasso_alpha = 0.1
-    if model_type == "ridge":
-        ridge_alpha = st.number_input("Ridge alpha", min_value=0.01, value=1.0, step=0.1)
-    if model_type == "lasso":
-        lasso_alpha = st.number_input("Lasso alpha", min_value=0.01, value=0.1, step=0.01)
 
-    bayesian_samples = 500
-    bayesian_tune = 300
-    if model_type in ["bayesian", "hierarchical"]:
-        bayesian_samples = st.number_input(
-            "Bayesian samples", min_value=100, value=500, step=100
-        )
-        bayesian_tune = st.number_input(
-            "Bayesian tune", min_value=100, value=300, step=50
-        )
+# ============ STEP 2 ============
+def render_step2():
+    if st.session_state.df is None or not st.session_state.channel_cols:
+        st.warning("Missing data or channels. Going back to Step 1.")
+        st.session_state.step = 1
+        st.rerun()
+    st.header("Step 2: Transform & Model Parameters")
+    st.caption("Per-channel transformation, curvature, adstock, and fit")
 
-    st.header("⚙️ Constraints")
-    positive_constraints = st.checkbox(
-        "Ensure positive coefficients",
-        value=True,
-        help="Channel effects must be >= 0",
-    )
-    use_lag_sum = st.checkbox(
-        "Constrain lag sum (channel coefficients)",
-        value=False,
-    )
-    if use_lag_sum:
-        lag_lower = st.number_input(
-            "Lag sum lower bound",
-            min_value=0.0,
-            value=0.8,
-            step=0.1,
-        )
-        lag_upper = st.number_input(
-            "Lag sum upper bound",
-            min_value=0.0,
+    df = st.session_state.df
+    channel_cols = st.session_state.channel_cols
+    target_col = st.session_state.target_col
+    date_col = st.session_state.date_col or "date"
+
+    TRANSFORM_LABELS = {
+        "hill": "Hill",
+        "negative_exponential": "Negative exponential",
+        "log": "Log",
+        "linear": "Linear",
+        "power": "Power",
+    }
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Per-channel transformation")
+        st.caption("Select transform type for each channel (all follow diminishing returns)")
+        channel_transform_types = {}
+        for ch in channel_cols:
+            channel_transform_types[ch] = st.selectbox(
+                f"{ch}",
+                list(TRANSFORM_LABELS.keys()),
+                index=1,  # default: negative_exponential
+                format_func=lambda x: TRANSFORM_LABELS[x],
+                key=f"transform_{ch}",
+            )
+        st.session_state.channel_transform_types = channel_transform_types
+
+        st.subheader("Curvature & Adstock")
+        alpha = st.slider(
+            "Curvature value (α)",
+            min_value=0.3,
+            max_value=2.0,
             value=1.0,
             step=0.1,
+            help="Shape for Hill/Power transforms",
+            key="step2_alpha",
         )
-    else:
-        lag_lower = None
-        lag_upper = None
-
-# Column mapping - always visible, works with any dataset
-if df is not None:
-    st.subheader("📋 Column Mapping")
-    st.caption("Map your dataset columns to target, marketing channels, and controls.")
-
-    cols = df.columns.tolist()
-    date_cols = [c for c in cols if "date" in c.lower() or "time" in c.lower() or "week" in c.lower()]
-    inferred_target = infer_target_column(cols)
-    target_idx = cols.index(inferred_target) if inferred_target in cols else 0
-
-    date_col = None
-    if any("date" in c.lower() or "time" in c.lower() or "week" in c.lower() for c in cols):
-        date_candidates = [c for c in cols if "date" in c.lower() or "time" in c.lower() or "week" in c.lower()]
-        date_col = date_candidates[0] if date_candidates else None
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        target_col = st.selectbox(
-            "Target (sales/revenue)",
-            cols,
-            index=target_idx,
-            help="The metric you want to attribute (e.g. sales, revenue, conversions)",
+        decay = st.slider(
+            "Adstock decay coefficient",
+            min_value=0.0,
+            max_value=0.95,
+            value=0.5,
+            step=0.05,
+            help="Higher = longer carryover effect",
+            key="step2_decay",
         )
+        max_lag = st.number_input(
+            "Number of adstock periods (months for monthly, weeks for weekly)",
+            min_value=1,
+            max_value=24,
+            value=4,
+            step=1,
+            key="step2_maxlag",
+        )
+        half_sat = st.number_input(
+            "Half-saturation (0 = auto)",
+            min_value=0.0,
+            value=0.0,
+            step=10.0,
+            key="step2_halfsat",
+        )
+
     with col2:
-        exclude_cols = [target_col] + (["date"] if "date" in df.columns else [])
-        numeric_cols = [
-            c for c in df.columns
-            if c not in exclude_cols and pd.api.types.is_numeric_dtype(df[c])
-        ]
-        default_channels = infer_channel_columns(df, target_col, ["date"])
-        channel_cols = st.multiselect(
-            "Channel columns (spend)",
-            numeric_cols,
-            default=default_channels,
-            help="Marketing spend columns (TV, digital, etc.)",
+        st.subheader("Model fit")
+        model_type = st.selectbox(
+            "Model type",
+            ["linear", "ridge", "lasso", "bayesian", "hierarchical"],
+            index=["linear", "ridge", "lasso", "bayesian", "hierarchical"].index(st.session_state.get("model_type", "linear")),
+            format_func=lambda x: {"linear": "Linear", "ridge": "Ridge", "lasso": "Lasso", "bayesian": "Bayesian", "hierarchical": "Hierarchical"}[x],
+            key="step2_model",
         )
-    with col3:
-        control_options = [
-            c for c in df.columns
-            if c not in [target_col, "date"] and c not in channel_cols
-        ]
-        control_cols = st.multiselect(
-            "Control columns",
-            control_options,
-            default=[],
-            help="Covariates (seasonality, holidays, promotions, etc.)",
+        ridge_alpha = 1.0
+        lasso_alpha = 0.1
+        bayesian_samples = 500
+        bayesian_tune = 300
+        if model_type == "ridge":
+            ridge_alpha = st.number_input("Ridge alpha", 0.01, 10.0, 1.0, 0.1, key="ridge_a")
+        elif model_type == "lasso":
+            lasso_alpha = st.number_input("Lasso alpha", 0.01, 10.0, 0.1, 0.01, key="lasso_a")
+        elif model_type in ["bayesian", "hierarchical"]:
+            bayesian_samples = st.number_input("Samples", 100, 2000, 500, 100, key="bay_samp")
+            bayesian_tune = st.number_input("Tune", 100, 1000, 300, 50, key="bay_tune")
+
+        config = MMMConfig(
+            target_col=target_col,
+            channel_cols=channel_cols,
+            control_cols=st.session_state.control_cols + st.session_state.segment_cols,
+            date_col=date_col,
+            adstock_decay=decay,
+            adstock_max_lag=max_lag,
+            saturation_alpha=alpha,
+            saturation_half_sat=half_sat if half_sat > 0 else None,
+            saturation_transform_type="negative_exponential",
+            channel_transform_types=channel_transform_types,
+            model_type=model_type,
+            ridge_alpha=ridge_alpha,
+            lasso_alpha=lasso_alpha,
+            bayesian_samples=bayesian_samples,
+            bayesian_tune=bayesian_tune,
         )
 
-# Main content
-if df is not None and channel_cols:
+        if st.button("Fit model", type="primary", key="step2_fit"):
+            from mmm.pipeline import MMMPipeline
 
-    config = MMMConfig(
-        target_col=target_col,
-        channel_cols=channel_cols,
-        control_cols=control_cols,
-        adstock_decay=decay,
-        adstock_max_lag=max_lag,
-        saturation_alpha=alpha,
-        saturation_half_sat=half_sat if half_sat > 0 else None,
-        positive_constraints=positive_constraints,
-        lag_sum_lower=lag_lower if use_lag_sum else None,
-        lag_sum_upper=lag_upper if use_lag_sum else None,
-        model_type=model_type,
-        ridge_alpha=ridge_alpha if model_type == "ridge" else 1.0,
-        lasso_alpha=lasso_alpha if model_type == "lasso" else 0.1,
-        bayesian_samples=bayesian_samples if model_type in ["bayesian", "hierarchical"] else 1000,
-        bayesian_tune=bayesian_tune if model_type in ["bayesian", "hierarchical"] else 500,
-    )
+            with st.spinner("Fitting..."):
+                try:
+                    pipeline = MMMPipeline(config)
+                    pipeline.fit(df)
+                    st.session_state.pipeline = pipeline
+                    st.session_state.fitted = True
+                except Exception as e:
+                    st.error(str(e))
+                    st.session_state.fitted = False
 
-    if st.button("🚀 Fit Model", type="primary"):
-        with st.spinner("Fitting model..."):
-            try:
-                pipeline = MMMPipeline(config)
-                pipeline.fit(df)
-                st.session_state["pipeline"] = pipeline
-                st.session_state["fitted"] = True
-            except Exception as e:
-                st.error(str(e))
-                st.session_state["fitted"] = False
-
-    if st.session_state.get("fitted"):
-        pipeline = st.session_state["pipeline"]
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
+        if st.session_state.get("fitted"):
+            pipeline = st.session_state.pipeline
             r2 = pipeline.score(df)
             st.metric("R² Score", f"{r2:.4f}")
-        with col2:
-            pred = pipeline.predict(df)
-            mape = np.mean(np.abs((df[target_col] - pred) / (df[target_col] + 1e-6))) * 100
-            st.metric("MAPE (%)", f"{mape:.2f}")
-        with col3:
-            st.metric("Channels", len(channel_cols))
+            coef = pipeline.get_coefficients()
+            st.dataframe(pd.DataFrame([{"Variable": k, "Coefficient": v} for k, v in coef.items()]))
 
-        st.subheader("Channel Attribution (Coefficients)")
-        coef = pipeline.get_coefficients()
-        coef_df = pd.DataFrame(
-            [{"Variable": k, "Coefficient": v} for k, v in coef.items()]
-        )
-        st.dataframe(coef_df, use_container_width=True)
-
-        fig_bar = px.bar(
-            coef_df[coef_df["Variable"] != "intercept"],
-            x="Variable",
-            y="Coefficient",
-            color="Coefficient",
-            color_continuous_scale="Blues",
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.subheader("Actual vs Predicted")
+    if st.session_state.get("fitted"):
+        st.divider()
+        st.subheader("Results")
+        pipeline = st.session_state.pipeline
         plot_df = df.copy()
         plot_df["predicted"] = pipeline.predict(df)
+        x_ax = plot_df[date_col] if date_col in plot_df.columns else plot_df.index
         fig = go.Figure()
-        x_col = date_col if date_col and date_col in plot_df.columns else ("date" if "date" in plot_df.columns else None)
-        x_axis = plot_df[x_col] if x_col else plot_df.index
-        fig.add_trace(go.Scatter(x=x_axis, y=plot_df[target_col], name="Actual", line=dict(color="#1f77b4")))
-        fig.add_trace(go.Scatter(x=x_axis, y=plot_df["predicted"], name="Predicted", line=dict(color="#ff7f0e", dash="dash")))
-        fig.update_layout(xaxis_title="Date", yaxis_title=target_col)
+        fig.add_trace(go.Scatter(x=x_ax, y=plot_df[target_col], name="Actual", line=dict(color="#1f77b4")))
+        fig.add_trace(go.Scatter(x=x_ax, y=plot_df["predicted"], name="Predicted", line=dict(color="#ff7f0e", dash="dash")))
+        fig.update_layout(title=f"{st.session_state.brand_name} - Actual vs Predicted")
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Residuals")
-        plot_df["residual"] = plot_df[target_col] - plot_df["predicted"]
-        fig_res = px.scatter(
-            plot_df,
-            x="predicted",
-            y="residual",
-            trendline="ols",
+        coef_df = pd.DataFrame(
+            [{"Variable": k, "Coefficient": v} for k, v in pipeline.get_coefficients().items()]
         )
-        fig_res.add_hline(y=0, line_dash="dash")
-        st.plotly_chart(fig_res, use_container_width=True)
+        fig_bar = px.bar(coef_df[coef_df["Variable"] != "intercept"], x="Variable", y="Coefficient", color="Coefficient")
+        st.plotly_chart(fig_bar, use_container_width=True)
 
+    st.divider()
+    if st.button("← Back to Step 1", key="step2_back"):
+        st.session_state.step = 1
+        st.rerun()
+
+
+# ============ MAIN ============
+st.title("📊 Marketing Mix Modelling")
+st.caption(f"Brand: {st.session_state.brand_name or '(not set)'}  |  Step {st.session_state.step} of 2")
+
+step_indicator = st.columns(2)
+with step_indicator[0]:
+    st.markdown("**Step 1**" + (" ✓" if st.session_state.step > 1 else " ←"))
+with step_indicator[1]:
+    st.markdown("**Step 2**" + (" ←" if st.session_state.step == 2 else ""))
+
+if st.session_state.step == 1:
+    render_step1()
 else:
-    if df is None:
-        st.info("Upload a CSV or use the sample dataset to get started.")
-    else:
-        st.warning("Select at least one channel column.")
+    render_step2()

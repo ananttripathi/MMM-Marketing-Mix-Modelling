@@ -94,6 +94,8 @@ class MMMPipeline:
             max_lag=self.config.adstock_max_lag,
             alpha=self.config.saturation_alpha,
             half_saturation=self.half_saturation_,
+            transform_type=self.config.saturation_transform_type,
+            channel_transform_types=self.config.channel_transform_types,
         )
 
         X_control = None
@@ -119,6 +121,8 @@ class MMMPipeline:
             max_lag=self.config.adstock_max_lag,
             alpha=self.config.saturation_alpha,
             half_saturation=self.half_saturation_,
+            transform_type=self.config.saturation_transform_type,
+            channel_transform_types=self.config.channel_transform_types,
         )
         X_control = None
         if self.control_names_:
