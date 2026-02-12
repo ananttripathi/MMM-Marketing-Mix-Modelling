@@ -15,14 +15,17 @@ class MMMConfig:
     date_col: str = "date"
     channel_cols: List[str] = field(default_factory=list)
     control_cols: List[str] = field(default_factory=list)
+    segment_cols: List[str] = field(default_factory=list)
+    channel_transform_types: Optional[dict] = None  # {channel: transform_type}
 
     # Adstock
     adstock_decay: float = 0.5
     adstock_max_lag: int = 4
 
-    # Saturation (Hill curve)
-    saturation_alpha: float = 1.0  # shape/curvature
+    # Saturation (diminishing returns)
+    saturation_alpha: float = 1.0  # shape for hill/power
     saturation_half_sat: Optional[float] = None  # auto from data if None
+    saturation_transform_type: str = "negative_exponential"  # hill, negative_exponential, log, linear, power
 
     # Constraints
     positive_constraints: bool = True

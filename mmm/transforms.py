@@ -1,6 +1,18 @@
-"""Adstock and saturation transforms for MMM."""
+"""Adstock and saturation transforms for MMM.
+
+All saturation transforms follow the law of diminishing marginal returns:
+- Negative exponential: 1 - exp(-x/k)
+- Log: log(1 + x/k), scaled
+- Linear (reciprocal): x/(k+x)
+- Power (Hill): x^α/(k^α+x^α), α in (0,1)
+"""
+
+from typing import Optional
 
 import numpy as np
+
+# Transform types that satisfy diminishing marginal returns
+TRANSFORM_TYPES = ["hill", "negative_exponential", "log", "linear", "power"]
 
 
 def adstock_transform(
@@ -52,13 +64,49 @@ def saturation_transform(
     x: np.ndarray,
     alpha: float = 1.0,
     half_saturation: float = 50.0,
+    transform_type: str = "negative_exponential",
 ) -> np.ndarray:
     """
-    Hill saturation: x^alpha / (half_sat^alpha + x^alpha).
-    alpha (curvature): >1 = S-curve, 1 = concave, <1 = convex.
+    Apply saturation transform. All types satisfy diminishing marginal returns.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input (adstocked spend).
+    alpha : float
+        Shape parameter (for hill/power).
+    half_saturation : float
+        Scale parameter (spend at ~50% saturation).
+    transform_type : str
+        "hill", "negative_exponential", "log", "linear", "power"
     """
     x_safe = np.maximum(x, 1e-10)
-    return (x_safe ** alpha) / ((half_saturation ** alpha) + (x_safe ** alpha))
+    k = max(half_saturation, 1e-6)
+
+    if transform_type == "hill":
+        # Hill: x^α / (k^α + x^α)
+        return (x_safe ** alpha) / ((k ** alpha) + (x_safe ** alpha))
+
+    elif transform_type == "negative_exponential":
+        # 1 - exp(-x/k): saturates at 1, concave
+        return 1.0 - np.exp(-x_safe / k)
+
+    elif transform_type == "log":
+        # log(1 + x/k) / log(1 + 50): scaled to ~[0,1], concave
+        log_scale = np.log(1 + 50)
+        return np.log(1 + x_safe / k) / log_scale
+
+    elif transform_type == "linear":
+        # x/(k+x): reciprocal, saturates at 1, concave
+        return x_safe / (k + x_safe)
+
+    elif transform_type == "power":
+        # x^α/(k^α+x^α) with α in (0,1): stronger concavity
+        a = max(0.1, min(alpha, 0.99))
+        return (x_safe ** a) / ((k ** a) + (x_safe ** a))
+
+    else:
+        raise ValueError(f"Unknown transform_type: {transform_type}. Use {TRANSFORM_TYPES}")
 
 
 def apply_transforms(
@@ -68,15 +116,19 @@ def apply_transforms(
     max_lag: int,
     alpha: float,
     half_saturation: float,
+    transform_type: str = "negative_exponential",
+    channel_transform_types: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Apply adstock then saturation to channel columns.
-    Returns (n_samples, n_channels) array.
+    channel_transform_types: {channel_name: transform_type} for per-channel override.
     """
+    channel_transform_types = channel_transform_types or {}
     X_channel = []
     for col in channel_cols:
         x = df[col].values.astype(float)
         x_adstock = adstock_transform(x, decay, max_lag)
-        x_sat = saturation_transform(x_adstock, alpha, half_saturation)
+        t = channel_transform_types.get(col, transform_type)
+        x_sat = saturation_transform(x_adstock, alpha, half_saturation, t)
         X_channel.append(x_sat)
     return np.column_stack(X_channel)
