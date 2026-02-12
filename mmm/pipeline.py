@@ -151,3 +151,44 @@ class MMMPipeline:
             else:
                 out[k] = v
         return out
+
+    def get_channel_contributions(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """
+        Get per-channel contribution to the target for each row.
+        Returns dict of channel_name -> array of contributions (length n_rows).
+        """
+        X_channel = apply_transforms(
+            df,
+            self.channel_names_,
+            decay=self.config.adstock_decay,
+            max_lag=self.config.adstock_max_lag,
+            alpha=self.config.saturation_alpha,
+            half_saturation=self.half_saturation_,
+            transform_type=self.config.saturation_transform_type,
+            channel_transform_types=self.config.channel_transform_types,
+        )
+        coef = self.model.get_coefficients()
+        out = {}
+        for i, ch in enumerate(self.channel_names_):
+            if ch in coef:
+                out[ch] = coef[ch] * X_channel[:, i]
+        return out
+
+    def get_marginal_roi(self, df: pd.DataFrame, channel: str, delta_pct: float = 0.01) -> float:
+        """
+        Approximate marginal ROI for a channel: (dRevenue/dSpend) at current spend.
+        Uses numerical differentiation: add delta_pct of spend, measure revenue change.
+        Returns mROI as a multiplier (e.g. 2.0 = $2 revenue per $1 extra spend).
+        """
+        contributions = self.get_channel_contributions(df)
+        base_contrib = float(np.sum(contributions.get(channel, np.zeros(len(df)))))
+        df_perturb = df.copy()
+        df_perturb[channel] = df_perturb[channel] * (1 + delta_pct)
+        contrib_perturb = self.get_channel_contributions(df_perturb)
+        new_contrib = float(np.sum(contrib_perturb.get(channel, np.zeros(len(df)))))
+        delta_revenue_units = new_contrib - base_contrib
+        delta_spend = float(df[channel].sum() * delta_pct)
+        if delta_spend <= 0:
+            return 0.0
+        # mROI = delta_revenue / delta_spend (in target units per $ spend)
+        return delta_revenue_units / delta_spend
